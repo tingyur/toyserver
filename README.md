@@ -1,6 +1,6 @@
 # toyserver
 
-Most of the code of this package is copied from vite, in order to learn how to write local server, do not use it.
+Do not use this package, most of the code is copied from vite, in order to learn how to write local server.
 
 ## Commit Message Format
 

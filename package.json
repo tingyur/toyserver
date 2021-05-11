@@ -27,6 +27,7 @@
   },
   "homepage": "https://github.com/tingyur/toyserver/tree/master/#readme",
   "scripts": {
+    "ddd": "./bin/toyserver.js",
     "start": "./bin/toyserver.js serve -c ./playground/toyserver.config.js",
     "dev": "run-p dev-client dev-node",
     "dev-client": "tsc -w --incremental --p src/client",

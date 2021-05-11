@@ -1,13 +1,6 @@
-import path from 'path'
 import fs from 'fs-extra'
+import path from 'path'
 import slash from 'slash'
-import {
-  moduleRE,
-  moduleIdToFileMap,
-  moduleFileToIdMap
-} from './server/serverPluginModuleResolve'
-import { clientPublicPath } from './server/serverPluginClient'
-import { resolveOptimizedCacheDir } from './optimizer'
 import {
   cleanUrl,
   resolveFrom,
@@ -15,6 +8,15 @@ import {
   lookupFile,
   parseNodeModuleId
 } from './utils'
+import {
+  moduleRE,
+  moduleIdToFileMap,
+  moduleFileToIdMap
+} from './server/serverPluginModuleResolve'
+import { resolveOptimizedCacheDir } from './optimizer'
+import { clientPublicPath } from './server/serverPluginClient'
+import chalk from 'chalk'
+import { isAsset } from './optimizer/pluginAssets'
 
 const debug = require('debug')('toyserver:resolve')
 const isWin = require('os').platform() === 'win32'
@@ -223,7 +225,7 @@ export function createResolver(
           resolver.requestToFile(result) !== resolver.requestToFile(publicPath)
         ) {
           throw new Error(
-            `[vite] normalizePublicPath check fail. please report to vite.`
+            `[toyserver] normalizePublicPath check fail. please report to toyserver.`
           )
         }
         return result
@@ -261,7 +263,7 @@ export function createResolver(
         const pkgPath = lookupFile(findPkgFrom, ['package.json'], true)
         if (!pkgPath) {
           throw new Error(
-            `[vite] can't find package.json for a node_module file: ` +
+            `[toyserver] can't find package.json for a node_module file: ` +
               `"${publicPath}". something is wrong.`
           )
         }
@@ -329,6 +331,102 @@ export function createResolver(
   return resolver
 }
 
+export const jsSrcRE = /\.(?:(?:j|t)sx?|vue)$|\.mjs$/
+const deepImportRE = /^([^@][^/]*)\/|^(@[^/]+\/[^/]+)\//
+
+/**
+ * Redirects a bare module request to a full path under /@modules/
+ * It resolves a bare node module id to its full entry path so that relative
+ * imports from the entry can be correctly resolved.
+ * e.g.:
+ * - `import 'foo'` -> `import '/@modules/foo/dist/index.js'`
+ * - `import 'foo/bar/baz'` -> `import '/@modules/foo/bar/baz.js'`
+ */
+export function resolveBareModuleRequest(
+  root: string,
+  id: string,
+  importer: string,
+  resolver: InternalResolver
+): string {
+  const optimized = resolveOptimizedModule(root, id)
+  if (optimized) {
+    // ensure optimized module requests always ends with `.js` - this is because
+    // optimized deps may import one another and in the built bundle their
+    // relative import paths ends with `.js`. If we don't append `.js` during
+    // rewrites, it may result in duplicated copies of the same dep.
+    return path.extname(id) === '.js' ? id : id + '.js'
+  }
+
+  let isEntry = false
+  const basedir = path.dirname(resolver.requestToFile(importer))
+  const pkgInfo = resolveNodeModule(basedir, id, resolver)
+  if (pkgInfo) {
+    if (!pkgInfo.entry) {
+      console.error(
+        chalk.yellow(
+          `[toyserver] dependency ${id} does not have default entry defined in ` +
+            `package.json.`
+        )
+      )
+    } else {
+      isEntry = true
+      id = pkgInfo.entry
+    }
+  }
+
+  if (!isEntry) {
+    const deepMatch = !isEntry && id.match(deepImportRE)
+    if (deepMatch) {
+      // deep import
+      const depId = deepMatch[1] || deepMatch[2]
+
+      // check if this is a deep import to an optimized dep.
+      if (resolveOptimizedModule(root, depId)) {
+        if (resolver.alias(depId) === id) {
+          // this is a deep import but aliased from a bare module id.
+          // redirect it the optimized copy.
+          return resolveBareModuleRequest(root, depId, importer, resolver)
+        }
+        if (!isAsset(id)) {
+          // warn against deep imports to optimized dep
+          console.error(
+            chalk.yellow(
+              `\n[toyserver] Avoid deep import "${id}" (imported by ${importer})\n` +
+                `because "${depId}" has been pre-optimized by toyserver into a single file.\n` +
+                `Prefer importing directly from the module entry:\n` +
+                chalk.cyan(`\n  import { ... } from "${depId}" \n\n`) +
+                `If the dependency requires deep import to function properly, \n` +
+                `add the deep path to ${chalk.cyan(
+                  `optimizeDeps.include`
+                )} in toyserver.config.js.\n`
+            )
+          )
+        }
+      }
+
+      // resolve ext for deepImport
+      const filePath = resolveNodeModuleFile(root, id)
+      if (filePath) {
+        const deepPath = id.replace(deepImportRE, '')
+        const normalizedFilePath = slash(filePath)
+        const postfix = normalizedFilePath.slice(
+          normalizedFilePath.lastIndexOf(deepPath) + deepPath.length
+        )
+        id += postfix
+      }
+    }
+  }
+
+  // check and warn deep imports on optimized modules
+  const ext = path.extname(id)
+  if (!jsSrcRE.test(ext)) {
+    // append import query for non-js deep imports
+    return id + (queryRE.test(id) ? '&import' : '?import')
+  } else {
+    return id
+  }
+}
+
 const toyserverOptimizedMap = new Map()
 
 export function resolveOptimizedModule(
@@ -355,7 +453,104 @@ export function resolveOptimizedModule(
   return tryResolve(id) || tryResolve(id + '.js')
 }
 
+interface NodeModuleInfo {
+  entry: string | undefined
+  entryFilePath: string | undefined
+  pkg: any
+}
+const nodeModulesInfoMap = new Map<string, NodeModuleInfo>()
 const nodeModulesFileMap = new Map()
+
+export function resolveNodeModule(
+  root: string,
+  id: string,
+  resolver: InternalResolver
+): NodeModuleInfo | undefined {
+  const cacheKey = `${root}#${id}`
+  const cached = nodeModulesInfoMap.get(cacheKey)
+  if (cached) {
+    return cached
+  }
+  let pkgPath
+  try {
+    // see if the id is a valid package name
+    pkgPath = resolveFrom(root, `${id}/package.json`)
+  } catch (e) {
+    debug(`failed to resolve package.json for ${id}`)
+  }
+
+  if (pkgPath) {
+    // if yes, this is a entry import. resolve entry file
+    let pkg
+    try {
+      pkg = fs.readJSONSync(pkgPath)
+    } catch (e) {
+      return
+    }
+    let entryPoint: string | undefined
+
+    // TODO properly support conditional exports
+    // https://nodejs.org/api/esm.html#esm_conditional_exports
+    // Note: this would require @rollup/plugin-node-resolve to support it too
+    // or we will have to implement that logic in toyserver's own resolve plugin.
+
+    if (!entryPoint) {
+      for (const field of mainFields) {
+        if (typeof pkg[field] === 'string') {
+          entryPoint = pkg[field]
+          break
+        }
+      }
+    }
+
+    if (!entryPoint) {
+      entryPoint = 'index.js'
+    }
+
+    // resolve object browser field in package.json
+    // https://github.com/defunctzombie/package-browser-field-spec
+    const browserField = pkg.browser
+    if (entryPoint && browserField && typeof browserField === 'object') {
+      entryPoint = mapWithBrowserField(entryPoint, browserField)
+    }
+
+    debug(`(node_module entry) ${id} -> ${entryPoint}`)
+
+    // save resolved entry file path using the deep import path as key
+    // e.g. foo/dist/foo.js
+    // this is the path raw imports will be rewritten to, and is what will
+    // be passed to resolveNodeModuleFile().
+    let entryFilePath: string | undefined
+
+    // respect user manual alias
+    const aliased = resolver.alias(id)
+    if (aliased && aliased !== id) {
+      entryFilePath = resolveNodeModuleFile(root, aliased)
+    }
+
+    if (!entryFilePath && entryPoint) {
+      // #284 some packages specify entry without extension...
+      entryFilePath = path.join(path.dirname(pkgPath), entryPoint!)
+      const postfix = resolveFilePathPostfix(entryFilePath)
+      if (postfix) {
+        entryPoint += postfix
+        entryFilePath += postfix
+      }
+      entryPoint = path.posix.join(id, entryPoint!)
+      // save the resolved file path now so we don't need to do it again in
+      // resolveNodeModuleFile()
+      nodeModulesFileMap.set(entryPoint, entryFilePath)
+    }
+
+    const result: NodeModuleInfo = {
+      entry: entryPoint!,
+      entryFilePath,
+      pkg
+    }
+    nodeModulesInfoMap.set(cacheKey, result)
+    return result
+  }
+}
 
 export function resolveNodeModuleFile(
   root: string,
@@ -373,4 +568,26 @@ export function resolveNodeModuleFile(
   } catch (e) {
     // error will be reported downstream
   }
+}
+
+const normalize = path.posix.normalize
+
+/**
+ * given a relative path in pkg dir,
+ * return a relative path in pkg dir,
+ * mapped with the "map" object
+ */
+function mapWithBrowserField(
+  relativePathInPkgDir: string,
+  map: Record<string, string>
+) {
+  const normalized = normalize(relativePathInPkgDir)
+  const foundEntry = Object.entries(map).find(([from]) => {
+    return normalize(from) === normalized
+  })
+  if (!foundEntry) {
+    return normalized
+  }
+  const [, to] = foundEntry
+  return normalize(to)
 }

@@ -7,9 +7,11 @@ import chokidar from 'chokidar'
 import { createResolver, InternalResolver } from '../resolver'
 import { SourceMap } from './serverPluginSourceMap'
 import { HMRWatcher } from './serverPluginHmr'
+import { moduleRewritePlugin } from './serverPluginModuleRewrite'
 import { serveStaticPlugin } from './serverPluginServeStatic'
 import { ServerConfig } from '../config'
 import { createCertificate } from '../utils/createCertificate'
+import { cachedRead } from '../utils'
 
 const server = http.createServer()
 server.listen()
@@ -60,10 +62,11 @@ export function createServer(config: ServerConfig): Server {
   // attach server context to koa context
   app.use((ctx, next) => {
     Object.assign(ctx, context)
+    ctx.read = cachedRead.bind(null, ctx)
     return next()
   })
 
-  const resolvedPlugins = [serveStaticPlugin]
+  const resolvedPlugins = [moduleRewritePlugin, serveStaticPlugin]
   resolvedPlugins.forEach((m) => m && m(context))
 
   const listen = server.listen.bind(server)

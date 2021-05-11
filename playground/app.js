@@ -1,4 +1,14 @@
-// document.getElementById('root').appendChild('Hello World')
-document
-  .getElementById('root')
-  .appendChild(document.createTextNode('Hello World'))
+import { sayHello } from './hello'
+
+const root = document.getElementById('root')
+function render() {
+  root.innerHTML = document.createTextNode(sayHello())
+}
+
+render()
+
+if (import.meta.hot) {
+  import.meta.hot.accept(() => {
+    render()
+  })
+}
